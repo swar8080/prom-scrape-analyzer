@@ -32,6 +32,16 @@ type cardinalityOptions struct {
 	Options
 }
 
+type initialScrapeMsg struct {
+	result *scrape.Result
+}
+
+type refreshedScrapeMsg struct {
+	result *scrape.Result
+}
+
+type triggerSeriesRefresh struct{}
+
 func (o *cardinalityOptions) addFlags(app extkingpin.AppClause) {
 	o.AddFlags(app)
 }
@@ -74,6 +84,7 @@ var noFiltering func(info scrape.SeriesInfo) bool = nil
 var flashDuration = 5 * time.Second
 
 type seriesTable struct {
+	refreshSeries    func() (*scrape.Result, error)
 	table            table.Model
 	spinner          spinner.Model
 	searchInput      textinput.Model
@@ -88,7 +99,11 @@ type seriesTable struct {
 	logger           log.Logger
 }
 
+<<<<<<< Updated upstream
 func newModel(sm map[string]scrape.SeriesSet, height int, logger log.Logger) *seriesTable {
+=======
+func newModel(sm map[string]scrape.SeriesSet, height int, refreshSeries func() (*scrape.Result, error)) *seriesTable {
+>>>>>>> Stashed changes
 	tbl := table.New(
 		table.WithColumns([]table.Column{
 			{Title: "Name", Width: 60},
@@ -121,6 +136,7 @@ func newModel(sm map[string]scrape.SeriesSet, height int, logger log.Logger) *se
 	ti.Placeholder = "Metric name"
 
 	m := &seriesTable{
+		refreshSeries:    refreshSeries,
 		table:            tbl,
 		seriesMap:        sm,
 		spinner:          sp,
@@ -134,10 +150,12 @@ func newModel(sm map[string]scrape.SeriesSet, height int, logger log.Logger) *se
 	return m
 }
 
-func (m *seriesTable) setTableRows(filter func(info scrape.SeriesInfo) bool) {
+func (m *seriesTable) setTableRows() {
 	var rows []table.Row
+	nameSearchString := strings.ToLower(m.searchInput.Value())
+
 	for _, r := range m.seriesMap.AsRows() {
-		if filter == nil || filter(r) {
+		if nameSearchString == "" || strings.Contains(strings.ToLower(r.Name), nameSearchString) {
 			rows = append(rows, table.Row{
 				r.Name,
 				strconv.Itoa(r.Cardinality),
@@ -223,13 +241,31 @@ func (m *seriesTable) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.err = msg
 		return m, tea.Quit
-	case *scrape.Result:
+	case initialScrapeMsg:
 		m.loading = false
-		m.seriesMap = msg.Series
-		m.seriesScrapeText = msg.SeriesScrapeText
-		m.infoTitle = m.formatInfoTitle(msg)
-		m.setTableRows(noFiltering)
-		return m, nil
+		m.seriesMap = msg.result.Series
+		m.seriesScrapeText = msg.result.SeriesScrapeText
+		m.infoTitle = m.formatInfoTitle(msg.result)
+		m.setTableRows()
+		return m, tea.Tick(time.Second*5, func(time.Time) tea.Msg {
+			return triggerSeriesRefresh{}
+		})
+	case triggerSeriesRefresh:
+		refresh := func() tea.Msg {
+			metrics, err := m.refreshSeries()
+			if err != nil {
+				return m.flashMsg.Flash("Failed to refresh series: "+err.Error(), internal.Error, flashDuration)()
+			}
+			return refreshedScrapeMsg{result: metrics}
+		}
+		scheduleNextRefresh := tea.Tick(time.Second*5, func(time.Time) tea.Msg {
+			return triggerSeriesRefresh{}
+		})
+
+		return m, tea.Batch(refresh, scheduleNextRefresh)
+	case refreshedScrapeMsg:
+		m.seriesMap = msg.result.Series
+		m.setTableRows()
 	}
 
 	if m.searchingMetrics {
@@ -335,7 +371,7 @@ func (m *seriesTable) updateWhileSearchingMetrics(msg tea.Msg) (tea.Model, tea.C
 			// Reset the search input and table back to their initial state
 			m.searchInput.Reset()
 			m.searchInput.Blur()
-			m.setTableRows(noFiltering)
+			m.setTableRows()
 
 			// Hide the search input and restore control to the table
 			m.searchingMetrics = false
@@ -347,16 +383,7 @@ func (m *seriesTable) updateWhileSearchingMetrics(msg tea.Msg) (tea.Model, tea.C
 				m.searchInput, cmd = m.searchInput.Update(msg)
 
 				oldRowCount := len(m.table.Rows())
-				if len(m.searchInput.Value()) > 0 {
-					v := strings.ToLower(m.searchInput.Value())
-					m.setTableRows(func(info scrape.SeriesInfo) bool {
-						return strings.Contains(strings.ToLower(info.Name), v)
-					})
-				} else {
-					// Show all rows
-					m.setTableRows(noFiltering)
-				}
-
+				m.setTableRows()
 				if oldRowCount != len(m.table.Rows()) {
 					//Reset the selected row since the current index might exceed the filtered count
 					m.table.SetCursor(0)
@@ -395,7 +422,14 @@ func registerCardinalityCommand(app *extkingpin.App) {
 		scrapeURL := opts.ScrapeURL
 		timeoutDuration := opts.Timeout
 
+<<<<<<< Updated upstream
 		metricTable := newModel(nil, opts.OutputHeight, logger)
+=======
+		metricTable := newModel(nil, opts.OutputHeight, func() (*scrape.Result, error) {
+			return refreshSeries(opts, log.NewNopLogger())
+		})
+
+>>>>>>> Stashed changes
 		p := tea.NewProgram(metricTable)
 		metricTable.program = p
 
@@ -410,28 +444,15 @@ func registerCardinalityCommand(app *extkingpin.App) {
 		})
 
 		g.Add(func() error {
-			maxSize, err := opts.MaxScrapeSizeBytes()
-			if err != nil {
-				err = errors.Wrapf(err, "failed to parse max scrape size")
-				p.Send(err)
-				return err
-			}
-
 			level.Info(logger).Log(
 				"msg", "scraping",
 				"url", scrapeURL,
 				"timeout", timeoutDuration,
-				"max_size", maxSize,
+				"max_size", opts.MaxScrapeSize,
 			)
 
 			t0 := time.Now()
-			scraper := scrape.NewPromScraper(
-				scrapeURL,
-				logger,
-				scrape.WithTimeout(timeoutDuration),
-				scrape.WithMaxBodySize(maxSize),
-			)
-			metrics, err := scraper.Scrape()
+			metrics, err := refreshSeries(opts, logger)
 			if err != nil {
 				p.Send(err)
 				return err
@@ -439,10 +460,38 @@ func registerCardinalityCommand(app *extkingpin.App) {
 
 			// Send the scraped data to the UI
 			level.Info(logger).Log("msg", "scraping complete", "duration", time.Since(t0))
-			p.Send(metrics)
+			p.Send(initialScrapeMsg{result: metrics})
 			return nil
 		}, func(error) {})
 
 		return nil
 	})
 }
+
+func refreshSeries(opts *cardinalityOptions, logger log.Logger) (*scrape.Result, error) {
+	maxSize, err := opts.MaxScrapeSizeBytes()
+	if err != nil {
+		err = errors.Wrapf(err, "failed to parse max scrape size")
+		return nil, err
+	}
+
+	scrapeURL := opts.ScrapeURL
+	timeoutDuration := opts.Timeout
+
+	scraper := scrape.NewPromScraper(
+		scrapeURL,
+		logger,
+		scrape.WithTimeout(timeoutDuration),
+		scrape.WithMaxBodySize(maxSize),
+	)
+
+	metrics, err := scraper.Scrape()
+	if err != nil {
+		return nil, err
+	}
+	return metrics, nil
+}
+
+// Initial scrape failed -> exit program
+// Subsequent scrape failed -> flash error and continue
+// Scrape succeeded, reset cursor to min(current index, new row count)
